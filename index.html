@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spider Spite</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #080810;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: 'Courier New', monospace;
+  user-select: none;
+  -webkit-user-select: none;
+}
+canvas { display: block; }
+#hint { margin-top: 8px; font-size: 11px; color: #333; }
+</style>
+</head>
+<body>
+<canvas id="game" width="640" height="520"></canvas>
+<div id="hint">WASD / Arrows to move &nbsp;·&nbsp; SHIFT to creep &nbsp;·&nbsp; SPACE to start</div>
+<script>'use strict';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 640, H = 520;
+
+// ── Isometric projection ──────────────────────────────────────────────────────
+// World X → screen (right-down), World Y → screen (left-down), World Z → screen (up)
+const ORIG = { x: 358, y: 200 };
+const IA = 1.0,  IB = 0.5;    // world X basis in screen
+const IC = -0.75, ID = 0.375; // world Y basis in screen
+const IZ = 1.0;               // world Z scale (up = neg screen Y)
+
+function w2s(wx, wy, wz = 0) {
+  return {
+    x: ORIG.x + wx * IA + wy * IC,
+    y: ORIG.y + wx * IB + wy * ID - wz * IZ
+  };
+}
+
+// Apply iso transform to ctx so shapes drawn at (wx, wy) land correctly on-screen
+function isoCtx(wz = 0) {
+  ctx.setTransform(IA, IB, IC, ID, ORIG.x, ORIG.y - wz * IZ);
+}
+
+function resetCtx() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+
+// ── Bed / world dimensions ────────────────────────────────────────────────────
+const BW   = 160;  // bed width  (world X: 0..BW)
+const BL   = 285;  // bed length (world Y: 0..BL, 0=headboard, BL=foot)
+const BFH  = 26;   // bed frame height
+const SURF = BFH + 7; // mattress surface Z
+
+// Human body center X, and Y extents
+const HCX  = BW / 2;   // 80
+const H_HEAD_Y = 18;
+const H_FOOT_Y = 262;
+
+// ── Wake sensitivity zones (world coords, centered at HCX) ───────────────────
+const ZONES = [
+  { y0: 8,   y1: 72,  xW: 30, s: 4.0 }, // head / face
+  { y0: 72,  y1: 148, xW: 46, s: 2.0 }, // chest
+  { y0: 148, y1: 218, xW: 40, s: 1.0 }, // belly
+  { y0: 218, y1: 268, xW: 34, s: 0.4 }, // legs
+];
+
+function getSensitivity(wx, wy) {
+  for (const z of ZONES)
+    if (wy >= z.y0 && wy < z.y1 && Math.abs(wx - HCX) < z.xW) return z.s;
+  return 0;
+}
+
+// ── Game state ────────────────────────────────────────────────────────────────
+let gs = 'start', deathType = '', score = 0, highScore = 0;
+let wakeMeter = 0, gameTime = 0;
+let shakeX = 0, shakeY = 0;
+
+// ── Spider ────────────────────────────────────────────────────────────────────
+const spider = { wx: HCX + 30, wy: H_FOOT_Y - 10, vx: 0, vy: 0, facing: 0, phase: 0 };
+
+// ── Swats ─────────────────────────────────────────────────────────────────────
+let swats = [], swatClock = 0, swatInterval = 290, swatCount = 0;
+
+// ── Particles ─────────────────────────────────────────────────────────────────
+let particles = [];
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+const keys = new Set();
+window.addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'Space' && (gs === 'start' || gs === 'dead')) startGame();
+});
+window.addEventListener('keyup', e => keys.delete(e.code));
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function dist(ax, ay, bx, by) { return Math.sqrt((bx-ax)**2+(by-ay)**2); }
+
+function spawnParticles(sx, sy, n, r, g, b) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, spd = 1 + Math.random() * 4;
+    particles.push({ sx, sy, vx: Math.cos(a)*spd, vy: Math.sin(a)*spd, life: 1, r, g, b });
+  }
+}
+
+function quad(pts, fill, stroke, lw = 1) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+  if (fill)  { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+}
+
+// ── Game control ──────────────────────────────────────────────────────────────
+function startGame() {
+  gs = 'playing'; deathType = '';
+  score = 0; wakeMeter = 0; gameTime = 0;
+  swats = []; swatClock = 0; swatInterval = 290; swatCount = 0;
+  particles = []; shakeX = shakeY = 0;
+  spider.wx = HCX + 30; spider.wy = H_FOOT_Y - 10;
+  spider.vx = 0; spider.vy = 0; spider.facing = 0; spider.phase = 0;
+}
+
+function killSpider(type) {
+  deathType = type; gs = 'dead';
+  if (score > highScore) highScore = score;
+  const ss = w2s(spider.wx, spider.wy, SURF);
+  spawnParticles(ss.x, ss.y, 20, 255, 50, 20);
+  shakeX = 9; shakeY = 9;
+}
+
+// ── Swat spawning ─────────────────────────────────────────────────────────────
+function spawnSwat() {
+  let wx, wy;
+  if (Math.random() < 0.6 && getSensitivity(spider.wx, spider.wy) > 0) {
+    const a = Math.random() * Math.PI * 2, d = 12 + Math.random() * 55;
+    wx = spider.wx + Math.cos(a) * d;
+    wy = spider.wy + Math.sin(a) * d;
+  } else {
+    wx = 20 + Math.random() * (BW - 40);
+    wy = 20 + Math.random() * (BL - 40);
+  }
+  wx = Math.max(18, Math.min(BW - 18, wx));
+  wy = Math.max(18, Math.min(BL - 18, wy));
+  const warnFrames = Math.max(50, 145 - swatCount * 4);
+  swats.push({ wx, wy, r: 36, phase: 'warn', timer: 0, warnFrames, swatFrames: 14 });
+  swatCount++;
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+function update() {
+  shakeX *= 0.76; shakeY *= 0.76;
+  if (Math.abs(shakeX) < 0.1) shakeX = 0;
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.sx += p.vx; p.sy += p.vy;
+    p.vx *= 0.88; p.vy *= 0.88;
+    p.life -= 1/28;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  if (gs !== 'playing') return;
+
+  gameTime++;
+  score = Math.floor(gameTime / 60);
+
+  // Spider input
+  let dx = 0, dy = 0;
+  if (keys.has('ArrowLeft')  || keys.has('KeyA')) dx -= 1;
+  if (keys.has('ArrowRight') || keys.has('KeyD')) dx += 1;
+  if (keys.has('ArrowUp')    || keys.has('KeyW')) dy -= 1;
+  if (keys.has('ArrowDown')  || keys.has('KeyS')) dy += 1;
+
+  const creep = keys.has('ShiftLeft') || keys.has('ShiftRight');
+  const spd = creep ? 0.8 : 2.7;
+
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.sqrt(dx*dx + dy*dy);
+    spider.vx = (dx / len) * spd;
+    spider.vy = (dy / len) * spd;
+    // Compute iso-aware facing direction (world angle → iso-projected angle for legs)
+    spider.facing = Math.atan2(dy, dx);
+  } else {
+    spider.vx *= 0.80; spider.vy *= 0.80;
+  }
+
+  spider.wx = Math.max(2, Math.min(BW - 2, spider.wx + spider.vx));
+  spider.wy = Math.max(2, Math.min(BL - 2, spider.wy + spider.vy));
+
+  const spd2 = Math.sqrt(spider.vx**2 + spider.vy**2);
+  spider.phase += spd2 * 0.3;
+
+  // Wake meter
+  const sens = getSensitivity(spider.wx, spider.wy);
+  if (sens > 0) {
+    wakeMeter += spd2 * sens * 0.36;
+    if (spd2 < 0.08) wakeMeter -= 0.022;
+  } else {
+    wakeMeter -= 0.048;
+  }
+  wakeMeter = Math.max(0, Math.min(100, wakeMeter));
+  if (wakeMeter >= 100) { killSpider('woken'); return; }
+
+  // Spawn swats
+  swatClock++;
+  if (swatClock >= swatInterval) {
+    spawnSwat();
+    swatClock = 0;
+    const base = Math.max(80, 290 - swatCount * 5);
+    swatInterval = base + Math.random() * base * 0.55;
+  }
+
+  // Update swats
+  for (let i = swats.length - 1; i >= 0; i--) {
+    const s = swats[i];
+    s.timer++;
+    if (s.phase === 'warn' && s.timer >= s.warnFrames) { s.phase = 'swat'; s.timer = 0; }
+    else if (s.phase === 'swat') {
+      if (s.timer === 1) {
+        if (dist(spider.wx, spider.wy, s.wx, s.wy) < s.r + 5) { killSpider('squished'); return; }
+        const ss = w2s(s.wx, s.wy, SURF);
+        spawnParticles(ss.x, ss.y, 12, 255, 180, 80);
+        shakeX += 5; shakeY += 5;
+      }
+      if (s.timer >= s.swatFrames + 55) swats.splice(i, 1);
+    }
+  }
+}
+
+// ── Drawing ───────────────────────────────────────────────────────────────────
+
+function drawRoom() {
+  // Floor
+  ctx.fillStyle = '#0e0c1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Back-left wall
+  ctx.fillStyle = '#14121e';
+  const wTL = w2s(0, 0, 120), wBL = w2s(0, BL, 120);
+  const fBL = w2s(0, BL, 0),  fTL = w2s(0, 0, 0);
+  quad([wTL, wBL, fBL, fTL], '#16141f');
+  // Back-right wall
+  const wTR = w2s(BW, 0, 120);
+  quad([wTL, wTR, w2s(BW, 0, 0), fTL], '#13111c');
+}
+
+function drawBedBack() {
+  const BHH = 55; // headboard height above surface
+
+  // Left face of bed frame (x=0)
+  quad([w2s(0,0,0), w2s(0,BL,0), w2s(0,BL,BFH), w2s(0,0,BFH)], '#3d2208');
+
+  // Headboard face (y=0)
+  quad([w2s(0,0,BFH), w2s(BW,0,BFH), w2s(BW,0,BFH+BHH), w2s(0,0,BFH+BHH)], '#5a3215');
+  // Headboard panel inset
+  quad([w2s(12,0,BFH+8), w2s(BW-12,0,BFH+8), w2s(BW-12,0,BFH+BHH-8), w2s(12,0,BFH+BHH-8)], '#6b3d1e');
+  // Headboard top cap
+  quad([w2s(0,0,BFH+BHH), w2s(BW,0,BFH+BHH), w2s(BW,0,BFH+BHH+5), w2s(0,0,BFH+BHH+5)], '#7a4820');
+}
+
+function drawMattress() {
+  // Mattress top (parallelogram)
+  const c = [w2s(0,0,SURF), w2s(BW,0,SURF), w2s(BW,BL,SURF), w2s(0,BL,SURF)];
+  quad(c, '#f0e8da');
+}
+
+function drawPillow() {
+  // Pillow: rounded area near headboard (in iso world coords)
+  const py0 = 8, py1 = 72, px0 = 14, px1 = BW - 14;
+  isoCtx(SURF);
+  ctx.fillStyle = '#e8dece';
+  ctx.beginPath();
+  // Draw a rounded rectangle in world space
+  const r = 10;
+  ctx.moveTo(px0 + r, py0);
+  ctx.lineTo(px1 - r, py0);
+  ctx.arcTo(px1, py0, px1, py0 + r, r);
+  ctx.lineTo(px1, py1 - r);
+  ctx.arcTo(px1, py1, px1 - r, py1, r);
+  ctx.lineTo(px0 + r, py1);
+  ctx.arcTo(px0, py1, px0, py1 - r, r);
+  ctx.lineTo(px0, py0 + r);
+  ctx.arcTo(px0, py0, px0 + r, py0, r);
+  ctx.closePath();
+  ctx.fill();
+
+  // Pillow crease
+  ctx.strokeStyle = '#d4c4b0';
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  ctx.moveTo(px0 + 4, (py0 + py1) / 2);
+  ctx.lineTo(px1 - 4, (py0 + py1) / 2);
+  ctx.stroke();
+
+  resetCtx();
+}
+
+function drawBlanket() {
+  const by0 = 85, by1 = BL - 8, bx0 = 10, bx1 = BW - 10;
+  isoCtx(SURF + 2);
+  ctx.fillStyle = '#2e567a';
+  ctx.beginPath();
+  const r = 8;
+  ctx.moveTo(bx0 + r, by0);
+  ctx.lineTo(bx1 - r, by0);
+  ctx.arcTo(bx1, by0, bx1, by0 + r, r);
+  ctx.lineTo(bx1, by1 - r);
+  ctx.arcTo(bx1, by1, bx1 - r, by1, r);
+  ctx.lineTo(bx0 + r, by1);
+  ctx.arcTo(bx0, by1, bx0, by1 - r, r);
+  ctx.lineTo(bx0, by0 + r);
+  ctx.arcTo(bx0, by0, bx0 + r, by0, r);
+  ctx.closePath();
+  ctx.fill();
+
+  // Folds
+  ctx.strokeStyle = '#25496a';
+  ctx.lineWidth = 7;
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 5; i++) {
+    const fy = by0 + 22 + i * 40;
+    if (fy > by1 - 10) break;
+    ctx.beginPath();
+    ctx.moveTo(bx0 + 6, fy);
+    ctx.bezierCurveTo(
+      bx0 + (bx1-bx0)*0.3, fy + (i%2 === 0 ? 10 : -10),
+      bx0 + (bx1-bx0)*0.7, fy + (i%2 === 0 ? -10 : 10),
+      bx1 - 6, fy
+    );
+    ctx.stroke();
+  }
+
+  // Top edge highlight
+  ctx.strokeStyle = '#4a78a8';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(bx0 + r, by0);
+  ctx.lineTo(bx1 - r, by0);
+  ctx.stroke();
+
+  resetCtx();
+}
+
+function drawHuman() {
+  const wakeRatio = wakeMeter / 100;
+  const cx = HCX;
+
+  isoCtx(SURF + 3);
+
+  // Neck
+  ctx.fillStyle = '#deba90';
+  ctx.beginPath();
+  ctx.ellipse(cx, 80, 16, 14, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Head (on pillow)
+  ctx.fillStyle = '#f0cc98';
+  ctx.beginPath();
+  ctx.ellipse(cx, 42, 34, 30, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Hair
+  ctx.fillStyle = '#2a1608';
+  ctx.beginPath();
+  ctx.ellipse(cx, 30, 34, 22, 0, Math.PI, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(cx - 34, 30, 12, 28);
+  ctx.fillRect(cx + 22, 30, 12, 28);
+
+  // Ears
+  ctx.fillStyle = '#deb880';
+  ctx.beginPath(); ctx.ellipse(cx - 34, 44, 7, 10, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx + 34, 44, 7, 10, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Closed eyes
+  ctx.strokeStyle = '#7a5030';
+  ctx.lineWidth = 6;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(cx - 13, 40, 7, 0.2*Math.PI, 0.8*Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx + 13, 40, 7, 0.2*Math.PI, 0.8*Math.PI); ctx.stroke();
+
+  // Furrowed brow when wake meter is high
+  if (wakeRatio > 0.45) {
+    const a = (wakeRatio - 0.45) / 0.55;
+    ctx.strokeStyle = `rgba(100, 60, 20, ${a * 0.75})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(cx - 22, 30); ctx.quadraticCurveTo(cx - 12, 26 - a*6, cx - 4, 30); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 4,  30); ctx.quadraticCurveTo(cx + 12, 26 - a*6, cx + 22, 30); ctx.stroke();
+  }
+
+  // Nose
+  ctx.fillStyle = '#c8a070';
+  ctx.beginPath(); ctx.ellipse(cx, 52, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Mouth (slightly open)
+  ctx.strokeStyle = '#9a6840';
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.ellipse(cx, 62, 9, 4, 0, 0.05*Math.PI, 0.95*Math.PI); ctx.stroke();
+
+  // Arms on sides
+  ctx.fillStyle = '#deba90';
+  ctx.beginPath(); ctx.ellipse(cx - 55, 130, 18, 44, 0.15, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx + 55, 130, 18, 44, -0.15, 0, Math.PI * 2); ctx.fill();
+
+  resetCtx();
+}
+
+function drawSwatZones() {
+  for (const s of swats) {
+    if (s.phase === 'warn') {
+      const pulse = 0.5 + 0.5 * Math.sin(s.timer * 0.25);
+      const urgency = s.timer / s.warnFrames;
+      const alpha = 0.18 + 0.18 * pulse + urgency * 0.15;
+
+      isoCtx(SURF + 4);
+      ctx.fillStyle = `rgba(255, 75, 0, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(s.wx, s.wy, s.r, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = `rgba(255, 150, 40, ${alpha * 2})`;
+      ctx.lineWidth = 2 + urgency * 5;
+      ctx.stroke();
+
+      // Pulsing inner ring
+      ctx.strokeStyle = `rgba(255, 220, 50, ${alpha * 1.6})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(s.wx, s.wy, s.r * (0.38 + 0.22 * pulse), 0, Math.PI * 2);
+      ctx.stroke();
+      resetCtx();
+
+      // Warning "!" in screen space
+      const ss = w2s(s.wx, s.wy, SURF + 4);
+      ctx.save();
+      ctx.globalAlpha = 0.5 + 0.5 * pulse;
+      ctx.fillStyle = '#ffdd00';
+      ctx.font = `bold ${14 + Math.floor(urgency * 5)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('!', ss.x, ss.y);
+      ctx.restore();
+
+    } else if (s.phase === 'swat') {
+      const t = Math.min(1, s.timer / s.swatFrames);
+
+      // Impact on surface
+      if (t <= 1) {
+        isoCtx(SURF + 4);
+        ctx.fillStyle = `rgba(255, 200, 80, ${(1-t) * 0.65})`;
+        ctx.beginPath();
+        ctx.arc(s.wx, s.wy, s.r * (1 + t * 0.5), 0, Math.PI * 2);
+        ctx.fill();
+        // Radial lines in world space
+        ctx.strokeStyle = `rgba(255, 230, 100, ${(1-t) * 0.8})`;
+        ctx.lineWidth = 2;
+        for (let j = 0; j < 8; j++) {
+          const a = (j/8) * Math.PI * 2 + t;
+          ctx.beginPath();
+          ctx.moveTo(s.wx + Math.cos(a)*s.r*0.7, s.wy + Math.sin(a)*s.r*0.7);
+          ctx.lineTo(s.wx + Math.cos(a)*s.r*1.6, s.wy + Math.sin(a)*s.r*1.6);
+          ctx.stroke();
+        }
+        resetCtx();
+
+        // Hand in screen space, descending
+        const ss = w2s(s.wx, s.wy, SURF);
+        drawHand(ss.x, ss.y, t);
+      }
+
+      if (s.timer > s.swatFrames) {
+        const fade = 1 - (s.timer - s.swatFrames) / 55;
+        isoCtx(SURF + 2);
+        ctx.fillStyle = `rgba(140, 70, 0, ${fade * 0.25})`;
+        ctx.beginPath();
+        ctx.arc(s.wx, s.wy, s.r, 0, Math.PI * 2);
+        ctx.fill();
+        resetCtx();
+      }
+    }
+  }
+}
+
+function drawHand(scx, scy, t) {
+  // t=0: hand 100px above, t=1: slammed down
+  ctx.save();
+  ctx.translate(scx, scy - 95 * (1 - t));
+  ctx.globalAlpha = t * 0.92;
+
+  const skin = '#e8c898', line = '#c0a068';
+  ctx.fillStyle = skin; ctx.strokeStyle = line; ctx.lineWidth = 1;
+
+  // Palm
+  ctx.beginPath(); ctx.ellipse(0, 14, 22, 18, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Fingers
+  const fx = [-15, -6, 2, 11, 19], fh = [24, 30, 32, 28, 20];
+  for (let f = 0; f < 5; f++) {
+    ctx.beginPath(); ctx.ellipse(fx[f], -fh[f]/2 - 4, 5, fh[f]/2 + 2, 0, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+  }
+  // Thumb
+  ctx.beginPath(); ctx.ellipse(-26, 8, 6.5, 15, -0.42, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSpider() {
+  if (gs === 'dead') return;
+  const { wx, wy, facing, phase } = spider;
+
+  isoCtx(SURF + 3);
+
+  // 8 legs drawn in world space (iso-projected naturally)
+  const legDefs = [
+    [-0.42, 9, 12, 0],
+    [-0.72, 9, 13, Math.PI],
+    [-1.08, 8, 11, Math.PI*0.5],
+    [-1.42, 7, 10, Math.PI*1.5],
+    [ 0.42, 9, 12, Math.PI],
+    [ 0.72, 9, 13, 0],
+    [ 1.08, 8, 11, Math.PI*1.5],
+    [ 1.42, 7, 10, Math.PI*0.5],
+  ];
+
+  ctx.strokeStyle = '#160800';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+
+  for (const [bOff, upper, lower, phOff] of legDefs) {
+    const wave = Math.sin(phase + phOff) * 0.2;
+    const a1 = facing + bOff + wave;
+    const kx = wx + Math.cos(a1) * upper;
+    const ky = wy + Math.sin(a1) * upper;
+    const a2 = a1 + (bOff < 0 ? -0.5 : 0.5) + wave * 0.4;
+    const fx = kx + Math.cos(a2) * lower;
+    const fy = ky + Math.sin(a2) * lower;
+    ctx.beginPath();
+    ctx.moveTo(wx, wy);
+    ctx.quadraticCurveTo(kx * 1.05, ky * 0.95 + wy * 0.05, fx, fy);
+    ctx.stroke();
+  }
+
+  // Abdomen
+  const abx = wx + Math.cos(facing + Math.PI) * 5;
+  const aby = wy + Math.sin(facing + Math.PI) * 5;
+  ctx.fillStyle = '#1a0c00';
+  ctx.beginPath(); ctx.ellipse(abx, aby, 8, 10, facing, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#2a1600';
+  ctx.beginPath(); ctx.ellipse(abx, aby, 4, 6, facing, 0, Math.PI*2); ctx.fill();
+
+  // Cephalothorax
+  const cfx = wx + Math.cos(facing) * 3;
+  const cfy = wy + Math.sin(facing) * 3;
+  ctx.fillStyle = '#281400';
+  ctx.beginPath(); ctx.ellipse(cfx, cfy, 6, 7, facing, 0, Math.PI*2); ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#ff2020';
+  const fwd = [Math.cos(facing), Math.sin(facing)];
+  const rgt = [Math.cos(facing + Math.PI/2), Math.sin(facing + Math.PI/2)];
+  for (const [rs, fs] of [[-3.5, 6.5], [0, 7.5], [3.5, 6.5]]) {
+    ctx.beginPath();
+    ctx.arc(wx + fwd[0]*fs + rgt[0]*rs, wy + fwd[1]*fs + rgt[1]*rs, 1.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  resetCtx();
+}
+
+function drawBedFront() {
+  // Right face (x=BW)
+  quad([w2s(BW,0,0), w2s(BW,BL,0), w2s(BW,BL,BFH), w2s(BW,0,BFH)], '#4a2208');
+  // Front/foot face (y=BL)
+  quad([w2s(0,BL,0), w2s(BW,BL,0), w2s(BW,BL,BFH), w2s(0,BL,BFH)], '#5c2e10');
+  // Footboard cap
+  quad([w2s(0,BL,BFH), w2s(BW,BL,BFH), w2s(BW,BL,BFH+10), w2s(0,BL,BFH+10)], '#6e3818');
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`;
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, 3.5 * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  const bW = 220, bH = 14;
+  const bX = W/2 - bW/2, bY = H - 32;
+
+  ctx.fillStyle = '#181818';
+  ctx.beginPath();
+  ctx.roundRect(bX - 3, bY - 3, bW + 6, bH + 6, 5);
+  ctx.fill();
+
+  const fill = (wakeMeter / 100) * bW;
+  if (fill > 0) {
+    const r = Math.min(255, Math.floor(255 * wakeMeter / 60));
+    const g = Math.min(255, Math.floor(255 * (1 - wakeMeter / 100) * 1.5));
+    ctx.fillStyle = `rgb(${r},${g},0)`;
+    ctx.beginPath();
+    ctx.roundRect(bX, bY, fill, bH, 3);
+    ctx.fill();
+  }
+
+  ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 3); ctx.stroke();
+
+  ctx.fillStyle = '#888'; ctx.font = '11px monospace'; ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right'; ctx.fillText('WAKE', bX - 7, bY + bH/2);
+  ctx.textAlign = 'left';  ctx.fillStyle = '#bbb'; ctx.fillText(`${score}s`, bX + bW + 7, bY + bH/2);
+  if (highScore > 0) {
+    ctx.textAlign = 'right'; ctx.fillStyle = '#555';
+    ctx.fillText(`best: ${highScore}s`, W - 8, bY + bH/2);
+  }
+
+  // Creep hint on sensitive area
+  if (gs === 'playing' && getSensitivity(spider.wx, spider.wy) >= 2.0) {
+    const a = 0.45 + 0.4 * Math.sin(Date.now() * 0.006);
+    ctx.fillStyle = `rgba(255, 200, 80, ${a})`;
+    ctx.textAlign = 'center'; ctx.font = '11px monospace';
+    ctx.fillText('HOLD SHIFT TO CREEP', W/2, bY - 14);
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = 'rgba(6, 5, 16, 0.84)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#cc2222'; ctx.font = 'bold 44px monospace';
+  ctx.fillText('SPIDER SPITE', W/2, H/2 - 95);
+  ctx.fillStyle = '#777'; ctx.font = '15px monospace';
+  ctx.fillText('You are a spider.', W/2, H/2 - 42);
+  ctx.fillText('Crawl across sleeping humans without waking them.', W/2, H/2 - 18);
+  ctx.fillText("If they swat and hit you — you're done.", W/2, H/2 + 10);
+  ctx.fillStyle = '#4a4a6a'; ctx.font = '13px monospace';
+  ctx.fillText('Move slowly on sensitive areas. SHIFT to creep silently.', W/2, H/2 + 50);
+  if (Math.floor(Date.now() / 530) % 2) {
+    ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('— PRESS SPACE TO START —', W/2, H/2 + 95);
+  }
+}
+
+function drawDeadScreen() {
+  ctx.fillStyle = 'rgba(6, 5, 16, 0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (deathType === 'squished') {
+    ctx.fillStyle = '#dd2222'; ctx.font = 'bold 40px monospace';
+    ctx.fillText('SQUISHED!', W/2, H/2 - 65);
+    ctx.fillStyle = '#aa4444'; ctx.font = '16px monospace';
+    ctx.fillText('The hand came down.', W/2, H/2 - 25);
+  } else {
+    ctx.fillStyle = '#ff9900'; ctx.font = 'bold 36px monospace';
+    ctx.fillText('THEY WOKE UP!', W/2, H/2 - 65);
+    ctx.fillStyle = '#cc7700'; ctx.font = '16px monospace';
+    ctx.fillText('You were not subtle enough.', W/2, H/2 - 25);
+  }
+  ctx.fillStyle = '#ddd'; ctx.font = '20px monospace';
+  ctx.fillText(`Survived: ${score} seconds`, W/2, H/2 + 18);
+  if (score > 0 && score >= highScore) {
+    ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 15px monospace';
+    ctx.fillText('✦ NEW HIGH SCORE ✦', W/2, H/2 + 50);
+  } else if (highScore > 0) {
+    ctx.fillStyle = '#556'; ctx.font = '13px monospace';
+    ctx.fillText(`Best: ${highScore} seconds`, W/2, H/2 + 50);
+  }
+  if (Math.floor(Date.now() / 530) % 2) {
+    ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 14px monospace';
+    ctx.fillText('— PRESS SPACE TO TRY AGAIN —', W/2, H/2 + 90);
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  ctx.save();
+  if (shakeX || shakeY) {
+    ctx.translate((Math.random()-0.5)*shakeX*2, (Math.random()-0.5)*shakeY*2);
+  }
+
+  drawRoom();
+  drawBedBack();     // headboard + left face (back of box)
+  drawMattress();    // white mattress top
+  drawPillow();      // pillow near headboard
+  drawBlanket();     // blanket covering torso+legs
+  drawHuman();       // person on top
+  drawSwatZones();   // warning/impact effects on surface
+  if (gs !== 'dead') drawSpider();
+  drawBedFront();    // right face + front/foot face (front of box, over-draws edges)
+
+  ctx.restore();
+
+  drawParticles();
+  drawHUD();
+
+  if (gs === 'start') drawStartScreen();
+  else if (gs === 'dead') drawDeadScreen();
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+function loop() { update(); render(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
