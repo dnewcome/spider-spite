@@ -18,11 +18,15 @@ body {
 }
 canvas { display: block; }
 #hint { margin-top: 8px; font-size: 11px; color: #333; }
+#attribution { margin-top: 6px; font-size: 11px; color: #666; }
+#attribution a { color: #8888aa; text-decoration: none; }
+#attribution a:hover { color: #aaaacc; }
 </style>
 </head>
 <body>
 <canvas id="game" width="640" height="520"></canvas>
 <div id="hint">WASD / Arrows to move &nbsp;·&nbsp; SHIFT to creep &nbsp;·&nbsp; SPACE to start</div>
+<div id="attribution">by <a href="https://dnuke.com" target="_blank">dnuke.com</a> &nbsp;·&nbsp; <a href="https://github.com/dnewcome" target="_blank">github.com/dnewcome</a></div>
 <script>'use strict';
 
 const canvas = document.getElementById('game');
